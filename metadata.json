@@ -1,0 +1,5 @@
+{
+  "name": "Kerala Lens Translator",
+  "description": "A travel companion that translates English text from images to Malayalam and other languages using Gemini AI.",
+  "requestFramePermissions": []
+}
