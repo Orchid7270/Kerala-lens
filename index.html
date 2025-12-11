@@ -21,6 +21,9 @@
                 cream: '#FFFDD0', // Off-white
                 dark: '#1a1a1a',
               }
+            },
+            animation: {
+              'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
             }
           }
         }
@@ -38,6 +41,26 @@
       .no-scrollbar {
         -ms-overflow-style: none;
         scrollbar-width: none;
+      }
+      
+      /* New Animations for Processing State */
+      @keyframes scan-vertical {
+        0% { transform: translateY(-100%); opacity: 0; }
+        50% { opacity: 1; }
+        100% { transform: translateY(100%); opacity: 0; }
+      }
+      
+      @keyframes pulse-ring {
+        0% { transform: scale(0.8); opacity: 0.5; }
+        100% { transform: scale(2.5); opacity: 0; }
+      }
+      
+      .animate-scan-vertical {
+        animation: scan-vertical 2s linear infinite;
+      }
+      
+      .animate-pulse-ring {
+        animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
       }
     </style>
   <script type="importmap">

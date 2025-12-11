@@ -1,8 +1,11 @@
-import { GoogleGenAI, Modality, Type } from "@google/genai";
+import { GoogleGenAI, Modality, Type, HarmCategory, HarmBlockThreshold } from "@google/genai";
 import { TranslationResult } from "../types";
 
 const MODEL_NAME = 'gemini-2.5-flash';
 const TTS_MODEL_NAME = 'gemini-2.5-flash-preview-tts';
+
+// Simple in-memory cache for audio to prevent re-fetching
+const ttsCache = new Map<string, ArrayBuffer>();
 
 /**
  * Analyzes an image to detect text and translate it.
@@ -147,6 +150,12 @@ export const translateText = async (
  * Generates audio for the provided text.
  */
 export const generateSpeech = async (text: string, voiceName: string = 'Kore'): Promise<ArrayBuffer> => {
+  // Check Cache first
+  const cacheKey = `${text}-${voiceName}`;
+  if (ttsCache.has(cacheKey)) {
+    return ttsCache.get(cacheKey)!;
+  }
+
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   try {
@@ -160,12 +169,25 @@ export const generateSpeech = async (text: string, voiceName: string = 'Kore'): 
             prebuiltVoiceConfig: { voiceName: voiceName },
           },
         },
+        safetySettings: [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+        ],
       },
     });
 
-    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    const candidate = response.candidates?.[0];
+    const base64Audio = candidate?.content?.parts?.[0]?.inlineData?.data;
+
+    // Check for text refusal/error from model
     if (!base64Audio) {
-      throw new Error("No audio data received");
+      const textResponse = candidate?.content?.parts?.[0]?.text;
+      if (textResponse) {
+        throw new Error(`Model refused: ${textResponse}`);
+      }
+      throw new Error(`No audio data received. Status: ${candidate?.finishReason || 'Unknown'}`);
     }
 
     const binaryString = window.atob(base64Audio);
@@ -174,6 +196,10 @@ export const generateSpeech = async (text: string, voiceName: string = 'Kore'): 
     for (let i = 0; i < len; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
+    
+    // Store in cache
+    ttsCache.set(cacheKey, bytes.buffer);
+
     return bytes.buffer;
   } catch (error) {
     console.error("TTS error:", error);

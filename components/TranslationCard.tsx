@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { TranslationResult } from '../types';
-import { Volume2, Check, Copy, Loader2, Play, Square, AlertCircle, Info } from 'lucide-react';
+import { Volume2, Check, Copy, Loader2, Play, Square, AlertCircle } from 'lucide-react';
 import { generateSpeech } from '../services/gemini';
 
 interface TranslationCardProps {
@@ -14,12 +14,22 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
   const [error, setError] = useState<string | null>(null);
   const [isCopied, setIsCopied] = useState(false);
 
-  // Refs for Web Audio API and Promise management
-  const audioContextRef = useRef<AudioContext | null>(null);
+  // Refs for managing playback and promises
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const contextRef = useRef<AudioContext | null>(null);
   const audioPromiseRef = useRef<Promise<ArrayBuffer> | null>(null);
 
-  // Clean up audio context when component unmounts or result changes
+  // Cleanup AudioContext on component unmount
+  useEffect(() => {
+    return () => {
+      if (contextRef.current) {
+        contextRef.current.close().catch(console.error);
+        contextRef.current = null;
+      }
+    };
+  }, []);
+
+  // Prefetch Audio when result changes
   useEffect(() => {
     // Reset state for new translation
     setPcmData(null);
@@ -29,10 +39,11 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
 
     // Define the fetch operation
     const fetchAudio = async () => {
-      // Don't prefetch if text is empty or very long (quota/latency optimization)
+      // Don't prefetch if text is empty or extremely long
       if (!result.translatedText || result.translatedText.length > 500) {
          return Promise.reject("Text too long for auto-prefetch");
       }
+      // Reverted to default 'Kore' voice as 'Puck' caused performance issues
       return generateSpeech(result.translatedText, 'Kore');
     };
 
@@ -48,7 +59,6 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
         }
       })
       .catch((e) => {
-        // We silently ignore prefetch errors; the user will see the error when they click "Pronounce"
         console.warn("Audio prefetch background error (silent):", e);
       });
     
@@ -62,49 +72,55 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
     if (sourceNodeRef.current) {
       try {
         sourceNodeRef.current.stop();
+        sourceNodeRef.current.disconnect();
       } catch (e) {
-        // Ignore errors if already stopped
+        // Ignore
       }
       sourceNodeRef.current = null;
     }
-    
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-       audioContextRef.current.close().catch(console.error);
-       audioContextRef.current = null;
-    }
-    
+    // Note: We DO NOT close the context here anymore, to allow fast replay
     setIsPlaying(false);
   };
 
   const playAudioData = async (data: ArrayBuffer) => {
     try {
-      stopPlayback(); // Ensure any existing audio is stopped
+      stopPlayback(); // Stop any currently playing audio
 
-      // Initialize AudioContext with the specific sample rate for Gemini TTS (24kHz)
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextClass({ sampleRate: 24000 });
-      audioContextRef.current = ctx;
-
-      // Gemini returns raw PCM 16-bit integers. Convert to Float32 [-1.0, 1.0]
-      const int16Data = new Int16Array(data);
-      const float32Data = new Float32Array(int16Data.length);
-      
-      for (let i = 0; i < int16Data.length; i++) {
-        float32Data[i] = int16Data[i] / 32768.0;
+      // Initialize context lazily if it doesn't exist
+      if (!contextRef.current) {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        contextRef.current = new AudioContextClass();
       }
 
-      // Create buffer: 1 channel (mono), correct length, 24kHz
-      const audioBuffer = ctx.createBuffer(1, float32Data.length, 24000);
-      audioBuffer.getChannelData(0).set(float32Data);
+      const ctx = contextRef.current;
 
-      // Create source
+      // Always check state and resume if suspended (common browser policy requirement)
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
+      }
+
+      // Gemini standard: 24kHz.
+      const SAMPLE_RATE = 24000;
+
+      // Efficiently convert Int16 PCM to Float32
+      const int16Data = new Int16Array(data);
+      const length = int16Data.length;
+      
+      // Create buffer with correct sample rate
+      const audioBuffer = ctx.createBuffer(1, length, SAMPLE_RATE);
+      const channelData = audioBuffer.getChannelData(0);
+      
+      // Simple loop is extremely fast in V8
+      for (let i = 0; i < length; i++) {
+        channelData[i] = int16Data[i] / 32768.0;
+      }
+
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(ctx.destination);
 
       source.onended = () => {
         setIsPlaying(false);
-        sourceNodeRef.current = null;
       };
 
       sourceNodeRef.current = source;
@@ -121,13 +137,12 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
   const handlePlayAudio = async () => {
     setError(null);
 
-    // Toggle: if playing, stop it.
     if (isPlaying) {
       stopPlayback();
       return;
     }
 
-    // 1. If we already have the data locally, play it immediately.
+    // 1. Check local cache (fastest)
     if (pcmData) {
       await playAudioData(pcmData);
       return;
@@ -137,28 +152,25 @@ export const TranslationCard: React.FC<TranslationCardProps> = ({ result }) => {
     try {
       let data: ArrayBuffer;
 
-      // 2. If a prefetch request is already in flight, wait for it instead of starting a new one.
+      // 2. Check in-flight promise
       if (audioPromiseRef.current) {
         try {
           data = await audioPromiseRef.current;
         } catch (prefetchError) {
-          // If the background prefetch failed, retry explicitly now
-          console.log("Prefetch failed previously, retrying...");
+          // Fallback to fresh request
           audioPromiseRef.current = null;
           data = await generateSpeech(result.translatedText, 'Kore');
         }
       } else {
-        // 3. No prefetch active, start a new request
+        // 3. New request
         data = await generateSpeech(result.translatedText, 'Kore');
       }
 
-      // Cache and play
       setPcmData(data);
       await playAudioData(data);
     } catch (err) {
       console.error(err);
       setError("Failed to load audio");
-      // Clear promise so user can try again next click
       audioPromiseRef.current = null;
     } finally {
       setIsGeneratingAudio(false);
