@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CameraInput } from './components/CameraInput';
 import { TranslationCard } from './components/TranslationCard';
 import { LanguageSelector } from './components/LanguageSelector';
 import { HistoryList } from './components/HistoryList';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { translateImage, translateText } from './services/gemini';
 import { TranslationResult, LanguageOption, AppState, HistoryItem } from './types';
-import { RefreshCw, AlertTriangle, Sparkles, BrainCircuit, History, Scan } from 'lucide-react';
+import { RefreshCw, AlertTriangle, Sparkles, BrainCircuit, History, MapPin, WifiOff } from 'lucide-react';
+import { Logger } from './utils/logger';
 
 const LANGUAGES: LanguageOption[] = [
   { code: 'en', name: 'English', nativeName: 'English' },
@@ -18,13 +20,18 @@ const LANGUAGES: LanguageOption[] = [
   { code: 'de', name: 'German', nativeName: 'Deutsch' },
 ];
 
-export default function App() {
+function AppContent() {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [result, setResult] = useState<TranslationResult | null>(null);
   const [selectedLanguage, setSelectedLanguage] = useState<LanguageOption>(LANGUAGES[1]); 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [processingStage, setProcessingStage] = useState<'reading' | 'translating'>('reading');
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  
+  // Geolocation State
+  const [userLocation, setUserLocation] = useState<{lat: number, lng: number} | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
   
   // App Launch State
   const [showSplash, setShowSplash] = useState(true);
@@ -33,14 +40,45 @@ export default function App() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
+  // Online/Offline Detection
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
   // Splash Screen Logic
   useEffect(() => {
-    // Keep splash screen for at least 1.8s to allow camera to warm up behind scenes
-    // and provide a polished "app loading" feel.
     const timer = setTimeout(() => {
       setShowSplash(false);
     }, 1800);
     return () => clearTimeout(timer);
+  }, []);
+
+  // Geolocation Request on Mount
+  useEffect(() => {
+    if ('geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          setUserLocation({
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+          });
+          setLocationStatus('granted');
+        },
+        (error) => {
+          Logger.warn("Location permission denied or unavailable", { error });
+          setLocationStatus('denied');
+        }
+      );
+    }
   }, []);
 
   // Load history asynchronously after mount
@@ -51,7 +89,7 @@ export default function App() {
         setHistory(JSON.parse(saved));
       }
     } catch (e) {
-      console.error("Failed to load history", e);
+      Logger.error("Failed to load history", e);
     } finally {
       setHistoryLoaded(true);
     }
@@ -65,7 +103,7 @@ export default function App() {
       const historyToSave = history.map(({ imageUrl, ...rest }) => rest);
       localStorage.setItem('kerala_lens_history', JSON.stringify(historyToSave));
     } catch (e) {
-      console.error("Failed to save history", e);
+      Logger.error("Failed to save history", e);
     }
   }, [history, historyLoaded]);
 
@@ -92,6 +130,12 @@ export default function App() {
   };
 
   const handleImageSelected = async (base64: string, targetLanguageOverride?: string) => {
+    if (!isOnline) {
+      setErrorMsg("You are currently offline. Please check your internet connection.");
+      setAppState(AppState.ERROR);
+      return;
+    }
+
     setSelectedImage(base64);
     setAppState(AppState.PROCESSING);
     setProcessingStage('reading');
@@ -100,7 +144,8 @@ export default function App() {
     const targetLang = targetLanguageOverride || selectedLanguage.name;
 
     try {
-      const translation = await translateImage(base64, targetLang);
+      // Pass the latest location to the service
+      const translation = await translateImage(base64, targetLang, userLocation);
       setResult(translation);
       addToHistory(translation);
       setAppState(AppState.SUCCESS);
@@ -111,6 +156,11 @@ export default function App() {
 
   const handleReTranslation = async (langName: string) => {
     if (!result) return;
+    if (!isOnline) {
+       setErrorMsg("Cannot translate while offline.");
+       setAppState(AppState.ERROR);
+       return;
+    }
     
     setAppState(AppState.PROCESSING);
     setProcessingStage('translating'); 
@@ -121,10 +171,13 @@ export default function App() {
         result.detectedText,
         result.sourceLanguage,
         langName,
-        result.confidenceScore || 0
+        result.confidenceScore || 0,
+        result.recommendations, // Preserve recommendations
+        result.essentialPhrases // Preserve essential phrases
       );
-      setResult(newTranslation);
-      addToHistory(newTranslation);
+      const mergedResult = { ...newTranslation };
+      setResult(mergedResult);
+      addToHistory(mergedResult);
       setAppState(AppState.SUCCESS);
     } catch (error: any) {
       handleError(error);
@@ -132,7 +185,7 @@ export default function App() {
   };
 
   const handleError = (error: any) => {
-    console.error(error);
+    Logger.error("App Operation Failed", error);
     setAppState(AppState.ERROR);
     
     const errorMessage = error.toString();
@@ -171,11 +224,15 @@ export default function App() {
 
   return (
     <>
+      {/* Offline Banner */}
+      {!isOnline && (
+        <div className="fixed top-0 left-0 right-0 z-50 bg-gray-900 text-white text-xs font-semibold py-1 px-4 text-center flex items-center justify-center gap-2 animate-in slide-in-from-top-full">
+           <WifiOff size={12} />
+           <span>Offline Mode: AI features unavailable</span>
+        </div>
+      )}
+
       {/* SPLASH SCREEN */}
-      {/* 
-        This overlay provides immediate visual feedback on load, removing the perception of "slowness" 
-        while allowing the heavy CameraInput component to initialize in the background.
-      */}
       <div 
         className={`fixed inset-0 z-50 bg-kerala-green flex flex-col items-center justify-center transition-all duration-700 ease-out ${
           showSplash ? 'opacity-100 visible' : 'opacity-0 invisible pointer-events-none'
@@ -196,7 +253,7 @@ export default function App() {
 
       <div className={`min-h-screen bg-gray-50 text-gray-900 font-sans transition-opacity duration-700 ${showSplash ? 'opacity-0' : 'opacity-100'}`}>
         {/* Header */}
-        <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm">
+        <header className={`sticky z-30 bg-white/80 backdrop-blur-md border-b border-gray-200 shadow-sm transition-all ${!isOnline ? 'top-6' : 'top-0'}`}>
           <div className="max-w-md mx-auto px-4 h-16 flex items-center justify-between">
             <button 
                onClick={resetApp}
@@ -224,13 +281,19 @@ export default function App() {
           {appState === AppState.IDLE && (
             <div className="text-center mb-1 animate-in slide-in-from-top-4 duration-500">
               <h2 className="text-xl font-bold text-gray-800">Travel Translator</h2>
-              <p className="text-sm text-gray-500">Point & Capture to translate instantly</p>
+              <p className="text-sm text-gray-500 flex items-center justify-center gap-1.5">
+                {locationStatus === 'granted' ? (
+                  <><MapPin size={12} className="text-kerala-green" /> Location Active</>
+                ) : (
+                  <>Point & Capture to translate instantly</>
+                )}
+              </p>
             </div>
           )}
 
-          {/* Language Selector */}
+          {/* Controls: Language */}
           {appState !== AppState.ERROR && (
-             <div className={`flex justify-center transition-opacity duration-300 ${appState === AppState.PROCESSING ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
+             <div className={`flex flex-col gap-3 items-center transition-opacity duration-300 ${appState === AppState.PROCESSING ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
                <LanguageSelector 
                  languages={LANGUAGES}
                  selectedLanguage={selectedLanguage}
@@ -267,7 +330,7 @@ export default function App() {
               </div>
             )}
 
-            {/* PROCESSING: New "Scanning" Animation */}
+            {/* PROCESSING */}
             {appState === AppState.PROCESSING && (
               <div className="flex flex-col items-center justify-center py-16 gap-8 animate-in fade-in zoom-in-95 duration-500">
                 <div className="relative w-32 h-32 flex items-center justify-center">
@@ -292,12 +355,24 @@ export default function App() {
 
                 <div className="text-center space-y-2">
                   <h3 className="text-2xl font-bold text-gray-800 animate-pulse">
-                    {processingStage === 'reading' ? 'Scanning Text...' : 'Translating...'}
+                    {processingStage === 'reading' ? 'Analyzing Layout...' : 'Translating...'}
                   </h3>
                   <div className="flex items-center justify-center gap-2 text-sm text-gray-500 font-medium">
-                     <span className={`transition-opacity duration-300 ${processingStage === 'reading' ? 'opacity-100 text-kerala-green' : 'opacity-40'}`}>Detecting</span>
+                     <span className={`transition-opacity duration-300 ${processingStage === 'reading' ? 'opacity-100 text-kerala-green' : 'opacity-40'}`}>
+                        Reasoning (3.0)
+                     </span>
                      <span className="text-gray-300">•</span>
                      <span className={`transition-opacity duration-300 ${processingStage === 'translating' ? 'opacity-100 text-kerala-green' : 'opacity-40'}`}>Converting</span>
+                  </div>
+                  <div className="flex flex-col gap-1 items-center">
+                    <p className="text-xs text-amber-600 bg-amber-50 inline-block px-2 py-1 rounded-md border border-amber-100">
+                      Using Gemini 3.0 Pro (High Precision)
+                    </p>
+                    {userLocation && (
+                      <p className="text-[10px] text-gray-400 flex items-center gap-1">
+                        <MapPin size={10} /> Location aware
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
@@ -349,5 +424,13 @@ export default function App() {
         </main>
       </div>
     </>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
   );
 }
